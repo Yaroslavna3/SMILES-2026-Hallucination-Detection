@@ -13,7 +13,9 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import f1_score
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, f1_score
 from sklearn.preprocessing import StandardScaler
 
 
@@ -29,6 +31,8 @@ class HallucinationProbe(nn.Module):
         super().__init__()
         self._net: nn.Sequential | None = None  # built lazily in fit()
         self._scaler = StandardScaler()
+        self._pca: PCA | None = None
+        self._models: list[LogisticRegression] = []
         self._threshold: float = 0.5  # tuned by fit_hyperparameters()
 
     # ------------------------------------------------------------------
@@ -79,35 +83,56 @@ class HallucinationProbe(nn.Module):
         Returns:
             ``self`` (for method chaining).
         """
+        X = np.asarray(X, dtype=np.float32)
+        y = y.astype(int)
+
         X_scaled = self._scaler.fit_transform(X)
 
-        self._build_network(X_scaled.shape[1])
+        max_components = min(X_scaled.shape[0] - 1, X_scaled.shape[1], 160)
+        if max_components >= 8 and X_scaled.shape[1] > max_components:
+            self._pca = PCA(n_components=max_components, random_state=42)
+            X_model = self._pca.fit_transform(X_scaled)
+        else:
+            self._pca = None
+            X_model = X_scaled
 
-        X_t = torch.from_numpy(X_scaled).float()
-        y_t = torch.from_numpy(y.astype(np.float32))
+        self._models = []
+        for c_value in (0.05, 0.1, 0.3, 1.0):
+            model = LogisticRegression(
+                C=c_value,
+                class_weight="balanced",
+                max_iter=3000,
+                random_state=42,
+                solver="liblinear",
+            )
+            model.fit(X_model, y)
+            self._models.append(model)
 
-        # Weight positive examples by neg/pos ratio to handle class imbalance.
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the training loop below.
-        # ------------------------------------------------------------------
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-
-        self.train()
-        for _ in range(200):
-            optimizer.zero_grad()
-            logits = self(X_t)
-            loss = criterion(logits, y_t)
-            loss.backward()
-            optimizer.step()
-        # ------------------------------------------------------------------
-
-        self.eval()
+        self._threshold = self._best_threshold_from_probs(
+            self._predict_proba_from_prepared(X_model), y
+        )
         return self
+
+    def _predict_proba_from_prepared(self, X_model: np.ndarray) -> np.ndarray:
+        probs = [model.predict_proba(X_model)[:, 1] for model in self._models]
+        return np.mean(probs, axis=0)
+
+    def _best_threshold_from_probs(self, probs: np.ndarray, y_true: np.ndarray) -> float:
+        candidates = np.unique(np.concatenate([probs, np.linspace(0.05, 0.95, 181)]))
+
+        best_threshold = 0.5
+        best_accuracy = -1.0
+        best_f1 = -1.0
+        for t in candidates:
+            y_pred_t = (probs >= t).astype(int)
+            acc = accuracy_score(y_true, y_pred_t)
+            score = f1_score(y_true, y_pred_t, zero_division=0)
+            if acc > best_accuracy or (acc == best_accuracy and score > best_f1):
+                best_accuracy = acc
+                best_f1 = score
+                best_threshold = float(t)
+
+        return best_threshold
 
     def fit_hyperparameters(
         self, X_val: np.ndarray, y_val: np.ndarray
@@ -129,19 +154,7 @@ class HallucinationProbe(nn.Module):
         """
         probs = self.predict_proba(X_val)[:, 1]
 
-        # Candidate thresholds: unique predicted probabilities plus a coarse grid.
-        candidates = np.unique(np.concatenate([probs, np.linspace(0.0, 1.0, 101)]))
-
-        best_threshold = 0.5
-        best_f1 = -1.0
-        for t in candidates:
-            y_pred_t = (probs >= t).astype(int)
-            score = f1_score(y_val, y_pred_t, zero_division=0)
-            if score > best_f1:
-                best_f1 = score
-                best_threshold = float(t)
-
-        self._threshold = best_threshold
+        self._threshold = self._best_threshold_from_probs(probs, y_val)
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -169,10 +182,14 @@ class HallucinationProbe(nn.Module):
             estimated probability of the hallucinated class (label 1).
             Used to compute AUROC.
         """
+        if not self._models:
+            raise RuntimeError("Probe has not been fitted yet.")
+
+        X = np.asarray(X, dtype=np.float32)
         X_scaled = self._scaler.transform(X)
-        X_t = torch.from_numpy(X_scaled).float()
-        with torch.no_grad():
-            logits = self(X_t)
-            prob_pos = torch.sigmoid(logits).numpy()
+        if self._pca is not None:
+            X_scaled = self._pca.transform(X_scaled)
+
+        prob_pos = self._predict_proba_from_prepared(X_scaled)
         return np.stack([1.0 - prob_pos, prob_pos], axis=1)
 

@@ -18,6 +18,7 @@ single entry point called from the notebook.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
 def aggregate(
@@ -41,21 +42,63 @@ def aggregate(
         Replace or extend the skeleton below with alternative layer selection,
         token pooling (mean, max, weighted), or multi-layer fusion strategies.
     """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the aggregation below.
-    # ------------------------------------------------------------------
+    real_positions = attention_mask.nonzero(as_tuple=False).flatten()
+    if real_positions.numel() == 0:
+        real_positions = torch.arange(hidden_states.size(1), device=attention_mask.device)
 
-    # Default: last real token of the final transformer layer.
-    layer = hidden_states[-1]          # (seq_len, hidden_dim)
+    last_pos = int(real_positions[-1].item())
+    valid_hidden = hidden_states[:, real_positions, :].float()
 
-    # Find the index of the last real (non-padding) token.
-    real_positions = attention_mask.nonzero(as_tuple=False)  # (n_real, 1)
-    last_pos = int(real_positions[-1].item())                 # scalar index
+    n_layers = hidden_states.size(0)
+    layer_ids = sorted({max(0, n_layers - 1 - step) for step in (0, 2, 4, 8)})
 
-    feature = layer[last_pos]          # (hidden_dim,)
+    window = min(48, valid_hidden.size(1))
+    tail_hidden = valid_hidden[:, -window:, :]
 
-    return feature
-    # ------------------------------------------------------------------
+    pieces: list[torch.Tensor] = []
+    stat_pieces: list[torch.Tensor] = []
+
+    for layer_id in layer_ids:
+        layer_all = valid_hidden[layer_id]
+        layer_tail = tail_hidden[layer_id]
+
+        last_vec = hidden_states[layer_id, last_pos, :].float()
+        mean_all = layer_all.mean(dim=0)
+        mean_tail = layer_tail.mean(dim=0)
+        max_tail = layer_tail.max(dim=0).values
+
+        pieces.extend(
+            [
+                last_vec,
+                mean_tail,
+                mean_all,
+                last_vec - mean_tail,
+                max_tail - mean_tail,
+            ]
+        )
+
+        norm_last = last_vec.norm().view(1)
+        norm_tail = mean_tail.norm().view(1)
+        tail_std = layer_tail.std(dim=0, unbiased=False).mean().view(1)
+        cosine = F.cosine_similarity(
+            last_vec.view(1, -1), mean_tail.view(1, -1), dim=1
+        )
+        stat_pieces.append(torch.cat([norm_last, norm_tail, tail_std, cosine]))
+
+    for left, right in zip(layer_ids, layer_ids[1:]):
+        prev_last = hidden_states[left, last_pos, :].float()
+        next_last = hidden_states[right, last_pos, :].float()
+        drift = (next_last - prev_last).norm().view(1)
+        cos = F.cosine_similarity(prev_last.view(1, -1), next_last.view(1, -1), dim=1)
+        stat_pieces.append(torch.cat([drift, cos]))
+
+    length_feature = torch.tensor(
+        [float(real_positions.numel()) / float(hidden_states.size(1))],
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+
+    return torch.cat(pieces + stat_pieces + [length_feature], dim=0)
 
 
 def extract_geometric_features(
@@ -81,12 +124,21 @@ def extract_geometric_features(
         norms, inter-layer cosine similarity (representation drift), or
         sequence length.
     """
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the geometric feature extraction below.
-    # ------------------------------------------------------------------
+    real_positions = attention_mask.nonzero(as_tuple=False).flatten()
+    if real_positions.numel() == 0:
+        return torch.zeros(0, dtype=hidden_states.dtype, device=hidden_states.device)
 
-    # Placeholder: returns an empty tensor (no geometric features).
-    return torch.zeros(0)
+    last_pos = int(real_positions[-1].item())
+    valid_hidden = hidden_states[:, real_positions, :].float()
+    last_by_layer = hidden_states[:, last_pos, :].float()
+
+    norms = last_by_layer.norm(dim=1)
+    layer_diffs = last_by_layer[1:] - last_by_layer[:-1]
+    drift = layer_diffs.norm(dim=1)
+    tail = valid_hidden[:, -min(48, valid_hidden.size(1)) :, :]
+    tail_var = tail.var(dim=1, unbiased=False).mean(dim=1)
+
+    return torch.cat([norms, drift, tail_var], dim=0)
 
 
 def aggregation_and_feature_extraction(
